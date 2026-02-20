@@ -25,6 +25,11 @@ DTYPE = "int16"
 WHISPER_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
 CHUNK_DURATION_SEC = 10 * 60  # 10-minute chunks
 
+# Pricing (USD)
+WHISPER_COST_PER_MIN = 0.006
+CLAUDE_INPUT_COST_PER_TOKEN = 3.00 / 1_000_000
+CLAUDE_OUTPUT_COST_PER_TOKEN = 15.00 / 1_000_000
+
 SUMMARIZE_PROMPT = """\
 You are a documentation assistant. You will receive a raw transcript of someone \
 narrating their customer-support / debugging work. The speaker references Jira \
@@ -33,21 +38,35 @@ ticket numbers (like PROJ-1234, DATA-567, etc.) as they move between tasks.
 Your job:
 1. Identify every Jira ticket number mentioned in the transcript.
 2. Group the actions by ticket.
-3. For each ticket, produce a clean, numbered step-by-step list of what was done.
+3. For each ticket, start with a bold TL;DR block summarizing the problem, root \
+   cause, and fix in 1-2 sentences each. Then list the detailed numbered steps.
 4. If any actions don't reference a specific ticket, group them under "## General".
 5. Use past tense, be concise, and preserve technical details (table names, field \
    names, IDs, values).
+6. When the speaker explains WHY they are doing something (reasoning, hypotheses, \
+   expectations), preserve that rationale inline with the step. Use an "—" dash to \
+   append the reasoning to the action. For example: "Ran the missing_transactions \
+   report — this checks for discrepancies between supply invoices, purchase orders, \
+   and shipments, which could explain the ledger mismatch".
 
 Output format (markdown):
 
 ## PROJ-1234
+**Problem:** Brief description of the issue.
+**Root cause:** What was actually wrong.
+**Fix:** What was done to resolve it.
+
 1. Step one
 2. Step two
 
 ## OTHER-5678
+**Problem:** ...
+**Root cause:** ...
+**Fix:** ...
+
 1. Step one
 
-Do NOT include any preamble or explanation — only the grouped steps.
+Do NOT include any preamble or explanation outside of the ticket sections.
 """
 
 
@@ -143,9 +162,19 @@ def chunk_wav(wav_path: Path) -> list[Path]:
     return chunks
 
 
-def transcribe(audio_path: Path) -> str:
-    """Transcribe audio via Whisper API, chunking if necessary."""
+def get_wav_duration_sec(wav_path: Path) -> float:
+    """Get duration of a WAV file in seconds."""
+    with wave.open(str(wav_path), "rb") as wf:
+        return wf.getnframes() / wf.getframerate()
+
+
+def transcribe(audio_path: Path) -> tuple[str, float]:
+    """Transcribe audio via Whisper API, chunking if necessary.
+
+    Returns (transcript_text, audio_duration_seconds).
+    """
     client = openai.OpenAI()
+    audio_duration = get_wav_duration_sec(audio_path)
     chunks = chunk_wav(audio_path)
     transcripts = []
 
@@ -168,11 +197,14 @@ def transcribe(audio_path: Path) -> str:
 
     full_transcript = " ".join(transcripts)
     print(f"Transcription complete ({len(full_transcript)} characters).\n")
-    return full_transcript
+    return full_transcript, audio_duration
 
 
-def summarize(transcript: str) -> str:
-    """Send transcript to Claude for structured summarization."""
+def summarize(transcript: str) -> tuple[str, int, int]:
+    """Send transcript to Claude for structured summarization.
+
+    Returns (summary_text, input_tokens, output_tokens).
+    """
     print("Summarizing with Claude...")
     client = anthropic.Anthropic()
     message = client.messages.create(
@@ -186,8 +218,10 @@ def summarize(transcript: str) -> str:
         ],
     )
     summary = message.content[0].text
+    input_tokens = message.usage.input_tokens
+    output_tokens = message.usage.output_tokens
     print("Summary complete.\n")
-    return summary
+    return summary, input_tokens, output_tokens
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -253,7 +287,7 @@ def main():
         record_audio(audio_path)
 
     # Transcribe
-    transcript = transcribe(audio_path)
+    transcript, audio_duration = transcribe(audio_path)
     print("=" * 60)
     print("TRANSCRIPT")
     print("=" * 60)
@@ -262,8 +296,10 @@ def main():
 
     # Summarize
     summary = None
+    claude_input_tokens = 0
+    claude_output_tokens = 0
     if not args.no_summary:
-        summary = summarize(transcript)
+        summary, claude_input_tokens, claude_output_tokens = summarize(transcript)
         print("=" * 60)
         print("SUMMARY")
         print("=" * 60)
@@ -278,6 +314,27 @@ def main():
     # Save log
     log_path = save_log(transcript, summary)
     print(f"Log saved to: {log_path}")
+
+    # Cost summary
+    whisper_cost = (audio_duration / 60) * WHISPER_COST_PER_MIN
+    claude_cost = (
+        claude_input_tokens * CLAUDE_INPUT_COST_PER_TOKEN
+        + claude_output_tokens * CLAUDE_OUTPUT_COST_PER_TOKEN
+    )
+    total_cost = whisper_cost + claude_cost
+
+    print()
+    print("=" * 60)
+    print("COST")
+    print("=" * 60)
+    audio_mins, audio_secs = divmod(int(audio_duration), 60)
+    print(f"  Whisper:  {audio_mins}m{audio_secs}s audio  →  ${whisper_cost:.4f}")
+    if claude_input_tokens:
+        print(
+            f"  Claude:   {claude_input_tokens:,} in + {claude_output_tokens:,} out tokens"
+            f"  →  ${claude_cost:.4f}"
+        )
+    print(f"  Total:    ${total_cost:.4f}")
 
 
 if __name__ == "__main__":
